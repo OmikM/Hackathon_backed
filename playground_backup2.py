@@ -324,76 +324,6 @@ def fetch_elevations(coords):
 
 
 # --------------------------------------------------------------------------
-# 4b. DIAGNOSTICS -- is there actually any wind gradient to route around?
-# --------------------------------------------------------------------------
-#
-# A 0% energy saving from the optimizer isn't necessarily a bug: if the wind
-# is (near-)uniform across the whole lattice, any lateral detour only adds
-# flight distance with nothing to offset it, so the straight line IS the
-# minimum-energy route. Two things can cause that honestly:
-#   1. Physically flat wind field -- e.g. open water often has far less
-#      short-range wind variation than mixed coastal/urban terrain.
-#   2. Under-resolved: if the whole route fits inside a single native grid
-#      cell of the underlying weather model (ICON ~2-11km over Europe,
-#      HRRR ~3km over the US, GFS ~13-25km elsewhere), every lattice node
-#      gets the same or a near-identical interpolated reading regardless of
-#      how many distinct nodes you sample -- there's no real information
-#      there to route around, independent of anything this script does.
-# This just measures and reports which one (if either) is going on, so a
-# 0% result is diagnosable instead of a mystery.
-
-def wind_field_diagnostics(atmos_lookup: dict) -> dict:
-    """Circular-aware spread of wind speed/direction across every node
-    currently in atmos_lookup, plus how many distinct weather-cache buckets
-    those nodes actually collapsed into."""
-    speeds = [v["wind_speed"] for v in atmos_lookup.values()]
-    dirs = [v["wind_dir_from_deg"] for v in atmos_lookup.values()]
-    n = len(dirs)
-    speed_min, speed_max = (min(speeds), max(speeds)) if speeds else (0.0, 0.0)
-
-    # Direction is circular (0 deg == 360 deg), so a plain max-min would be
-    # misleading near the wraparound. Use the mean resultant length R of the
-    # unit vectors instead: R=1 means every node has identical direction,
-    # R->0 means directions are spread across the full circle. Convert to a
-    # circular standard deviation in degrees for something intuitive to read.
-    if n:
-        sin_sum = sum(math.sin(math.radians(d)) for d in dirs)
-        cos_sum = sum(math.cos(math.radians(d)) for d in dirs)
-        R = math.hypot(sin_sum, cos_sum) / n
-    else:
-        R = 1.0
-    dir_circ_std_deg = math.degrees(math.sqrt(max(0.0, -2 * math.log(R)))) if R > 1e-9 else 0.0
-
-    unique_buckets = len({_bucket(*node) for node in atmos_lookup})
-    return {
-        "speed_min": speed_min,
-        "speed_max": speed_max,
-        "speed_spread": speed_max - speed_min,
-        "dir_circ_std_deg": dir_circ_std_deg,
-        "unique_nodes": n,
-        "unique_buckets": unique_buckets,
-    }
-
-
-def print_wind_field_diagnostics(atmos_lookup: dict):
-    stats = wind_field_diagnostics(atmos_lookup)
-    print(f"\nWind field spread across the {stats['unique_nodes']} lattice nodes "
-          f"({stats['unique_buckets']} unique ~{CACHE_SPATIAL_DEG*111:.1f}km wind buckets):")
-    print(f"  wind speed:      {stats['speed_min']:.2f} - {stats['speed_max']:.2f} m/s "
-          f"(spread {stats['speed_spread']:.2f} m/s)")
-    print(f"  wind direction:  circular std-dev {stats['dir_circ_std_deg']:.1f} deg")
-
-    if stats["unique_buckets"] <= 1:
-        print("  -> All lattice nodes fall in the SAME weather-model grid cell -- there is "
-              "no spatial wind information here for the optimizer to route around, "
-              "independent of anything the routing code does. A 0% saving is expected.")
-    elif stats["speed_spread"] < 0.3 and stats["dir_circ_std_deg"] < 5:
-        print("  -> Wind is essentially uniform across this corridor (common over open "
-              "water/flat terrain at short range). With no real gradient to exploit, "
-              "converging on the straight line is the correct answer, not a bug.")
-
-
-# --------------------------------------------------------------------------
 # 5. GEOMETRY -- build a lattice of candidate routes between A and B
 # --------------------------------------------------------------------------
 
@@ -766,8 +696,6 @@ def main():
           f"{min(elevations):.0f} - {max(elevations):.0f} m ASL "
           f"(Copernicus GLO-90 DEM) -- now factored into edge cost as "
           f"climb power, not just reported (see climb_power_w)")
-
-    print_wind_field_diagnostics(atmos_lookup)
 
     # Shared across both searches: every centerline edge is evaluated by
     # both the Dijkstra search and the straight-line comparison, so caching

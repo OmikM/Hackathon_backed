@@ -6,9 +6,9 @@ from typing import List, Tuple, Dict, Literal
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
-from playground import DRONE, build_lattice, _bucket, CACHE_SPATIAL_DEG, CACHE_PATH, _STATS, \
+from playground_backup2 import DRONE, build_lattice, _bucket, CACHE_SPATIAL_DEG, CACHE_PATH, _STATS, \
 fetch_wind_and_atmos_batch, fetch_elevations, straight_route_energy, \
-solve_min_energy_route, NO_CACHE, print_wind_field_diagnostics
+solve_min_energy_route, NO_CACHE
 
 app = FastAPI(
     title="High-Performance Wind-Aware Routing API",
@@ -123,8 +123,6 @@ def plan_route_endpoint(payload: RouteRequest):
     print(f"Terrain elevation range along corridor: "
             f"{min(elevations):.0f} - {max(elevations):.0f} m ASL "
             f"(Copernicus GLO-90 DEM)")
-
-    print_wind_field_diagnostics(atmos_lookup)
 
     edge_cache = {}
     straight_e, straight_t = straight_route_energy(layers, atmos_lookup, elev_lookup, DRONE, edge_cache)
