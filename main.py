@@ -163,7 +163,7 @@ def evaluate_segment(p1: Tuple[float, float], p2: Tuple[float, float], wind_grid
                 best_energy, best_time = e_joules, t_sec
         return best_energy, best_time
 
-def generate_mode_aware_path(start: Tuple[float, float], goal: Tuple[float, float], mode: str, wind_grid: Dict, num_points: int = 50) -> List[Tuple[float, float]]:
+def generate_mode_aware_path(start: Tuple[float, float], goal: Tuple[float, float], mode: str, wind_grid: Dict, cfg: DroneConfig, num_points: int = 50) -> List[Tuple[float, float]]:
     dx = goal[0] - start[0]
     dy = goal[1] - start[1]
     dist = math.hypot(dx, dy)
@@ -172,31 +172,37 @@ def generate_mode_aware_path(start: Tuple[float, float], goal: Tuple[float, floa
 
     nx, ny = -dy / dist, dx / dist
     
-    # Create multiple segments so the line can "wiggle" as weather changes across the map
-    # A control point roughly every 20-30km, capped between 3 and 10 bends
-    num_segments = max(3, min(10, int(dist / 25000))) 
+    # 1. SPEC DYNAMICS
+    # Higher drag-to-mass ratio forces wider energy-saving detours
+    drag_sensitivity = (cfg.c_d * cfg.area) / max(0.5, cfg.mass)
     
+    # Slower drones get drifted more by crosswinds, requiring larger path adjustments
+    speed_factor = 18.0 / max(5.0, cfg.max_ground_speed)
+    
+    num_segments = max(3, min(10, int(dist / 25000))) 
     waypoints = [start]
     
     for i in range(1, num_segments):
         t = i / num_segments
         base_x, base_y = start[0] + t * dx, start[1] + t * dy
         
-        # Look up the weather precisely at this part of the journey
         u_wind, v_wind = get_wind_at(base_x, base_y, wind_grid)
         crosswind_push = u_wind * nx + v_wind * ny
         
-        # Allow the curve intensity to flex differently along the route
         if mode == "speed":
-            offset = (dist * 0.01) + (crosswind_push * dist * 0.003)
+            # Speed mode curve flexes based on ground speed limits vs wind push
+            offset = (dist * 0.01) + (crosswind_push * dist * 0.003 * speed_factor)
         else:
-            offset = (dist * 0.03) + (crosswind_push * dist * 0.01)
+            # Energy mode scales arc width based on drone drag/mass characteristics
+            base_curve = 0.03 * (1.0 + drag_sensitivity * 12.0)
+            wind_curve = 0.01 * speed_factor
+            offset = (dist * base_curve) + (crosswind_push * dist * wind_curve)
             
         waypoints.append((base_x + nx * offset, base_y + ny * offset))
         
     waypoints.append(goal)
     
-    # Smooth the multi-point line
+    # Catmull-Rom Smoothing
     extended_points = [waypoints[0]] + waypoints + [waypoints[-1]]
     smoothed_path = []
     pts_per_seg = max(2, num_points // num_segments)
@@ -238,10 +244,10 @@ def get_wind_grid_endpoint(payload: WindGridRequest):
 def plan_route_endpoint(payload: RouteRequest):
     start, goal = (payload.start_point.x, payload.start_point.y), (payload.goal_point.x, payload.goal_point.y)
     
-    # NEW: Fetch weather directly along the requested flight path, not just at the origin!
     wind_corridor = fetch_wind_along_path(payload.origin_lat, payload.origin_lon, start, goal, num_samples=10)
     
-    path_tuples = generate_mode_aware_path(start, goal, payload.mode, wind_corridor, num_points=60)
+    # Passed current_config so path shape reacts to mass, drag, and speed settings
+    path_tuples = generate_mode_aware_path(start, goal, payload.mode, wind_corridor, current_config, num_points=60)
     
     total_time, total_energy = 0.0, 0.0
     for i in range(len(path_tuples) - 1):
