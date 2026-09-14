@@ -46,9 +46,15 @@ class RouteRequest(BaseModel):
     origin_lat: float
     origin_lon: float
     start_point: Point2D
-    goal_point: Point2D
+
+    # nowy model: wiele punktów po kolei
+    waypoints: List[Point2D] = []
+
+    # stara kompatybilność
+    goal_point: Optional[Point2D] = None
+
     mode: Literal["energy", "speed"] = "speed"
-    step_size: float = 80.0  # Cell size in meters
+    step_size: float = 80.0
     grid_rows: int = 50
     grid_cols: int = 50
 
@@ -239,48 +245,50 @@ def fetch_wind_grid_batch(coords: List[Tuple[float, float]]) -> Dict[Tuple[float
             
     return results
 
-# --- MAIN ROUTING ENDPOINT ---
-@app.post("/api/v1/plan-route", response_model=RouteResponse)
-def plan_route_endpoint(payload: RouteRequest):
+def plan_single_leg(
+    start_point: Point2D,
+    goal_point: Point2D,
+    origin_lat: float,
+    origin_lon: float,
+    mode: str,
+    step_size: float,
+    grid_rows: int,
+    grid_cols: int,
+) -> dict:
     if not os.path.isfile(ALGORITHM_PATH):
         raise HTTPException(
             status_code=500,
             detail=f"Routing binary not found: {ALGORITHM_PATH}. Compile algorithm.cpp first.",
         )
 
-    if payload.step_size <= 0:
+    if step_size <= 0:
         raise HTTPException(status_code=422, detail="step_size must be greater than zero.")
-    grid_origin_x = min(0.0, payload.start_point.x, payload.goal_point.x)
-    grid_origin_y = min(0.0, payload.start_point.y, payload.goal_point.y)
-    start_r = round((payload.start_point.y - grid_origin_y) / payload.step_size)
-    start_c = round((payload.start_point.x - grid_origin_x) / payload.step_size)
-    goal_r = round((payload.goal_point.y - grid_origin_y) / payload.step_size)
-    goal_c = round((payload.goal_point.x - grid_origin_x) / payload.step_size)
 
-    # Expand the grid when necessary so the requested goal is not silently
-    # clamped to a different cell and returned as the wrong waypoint.
-    R = max(payload.grid_rows, start_r + 1, goal_r + 1)
-    C = max(payload.grid_cols, start_c + 1, goal_c + 1)
-    
-    # Convert local start/goal to grid indices
-    # Build coordinates for Open-Meteo
+    grid_origin_x = min(0.0, start_point.x, goal_point.x)
+    grid_origin_y = min(0.0, start_point.y, goal_point.y)
+    start_r = round((start_point.y - grid_origin_y) / step_size)
+    start_c = round((start_point.x - grid_origin_x) / step_size)
+    goal_r = round((goal_point.y - grid_origin_y) / step_size)
+    goal_c = round((goal_point.x - grid_origin_x) / step_size)
+
+    R = max(grid_rows, start_r + 1, goal_r + 1)
+    C = max(grid_cols, start_c + 1, goal_c + 1)
+
     grid_coords = [
         grid_to_lat_lon(
-            payload.origin_lat,
-            payload.origin_lon,
+            origin_lat,
+            origin_lon,
             r,
             c,
-            payload.step_size,
+            step_size,
             grid_origin_x,
             grid_origin_y,
         )
         for r in range(R) for c in range(C)
     ]
 
-    # Fetch batch wind field
     wind_data = fetch_wind_grid_batch(grid_coords)
 
-    # Format stdin matrix string for C++ process
     stdin_data = []
     idx = 0
     for r in range(R):
@@ -291,12 +299,24 @@ def plan_route_endpoint(payload: RouteRequest):
             row_str.append(f"{u:.2f} {v:.2f}")
             idx += 1
         stdin_data.append(" ".join(row_str))
-    
+
     input_payload = "\n".join(stdin_data)
 
-    # Execute C++ process
-    cmd = [ALGORITHM_PATH, str(R), str(C), str(start_r), str(start_c), str(goal_r), str(goal_c), str(payload.step_size)]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    cmd = [
+        ALGORITHM_PATH,
+        str(R), str(C),
+        str(start_r), str(start_c),
+        str(goal_r), str(goal_c),
+        str(step_size),
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     stdout, stderr = proc.communicate(input=input_payload)
 
     if proc.returncode != 0:
@@ -309,78 +329,96 @@ def plan_route_endpoint(payload: RouteRequest):
     cpp_path = cpp_out.get("path", [])
     if not cpp_path:
         raise HTTPException(status_code=422, detail="C++ solver could not find a flyable route.")
-    
-    # Convert path grid cells back to local meter offsets, matching the
-    # waypoint contract used by playground.py and the frontend.
-    waypoints = [
+
+    leg_waypoints = [
         Point2D(
-            x=grid_origin_x + c * payload.step_size,
-            y=grid_origin_y + r * payload.step_size,
+            x=grid_origin_x + c * step_size,
+            y=grid_origin_y + r * step_size,
         )
         for r, c in cpp_path
     ]
-    waypoints[0] = payload.start_point
-    waypoints[-1] = payload.goal_point
 
-    tot_time = cpp_out["total_time"]
+    if leg_waypoints:
+        leg_waypoints[0] = start_point
+        leg_waypoints[-1] = goal_point
+
+    total_time_seconds = float(cpp_out["total_time"])
     total_energy_wh = estimate_route_energy_wh(
         cpp_path,
         wind_data,
         grid_coords,
         C,
-        payload.step_size,
+        step_size,
     )
 
-    # --- Straight-line reference ---
-    # How would a direct bee-line from start to goal fare, flown through
-    # the exact same wind field? This is the baseline every wind-aware
-    # route here is meant to beat -- same idea as playground.py's
-    # straight_route_energy(), just on a discrete grid. The C++ solver
-    # already worked out the direct (Bresenham) path and its time; reuse
-    # that same path here so the energy figure is priced with the same
-    # fixed-airspeed model as total_energy_wh above, keeping the two
-    # numbers comparable.
-    straight_line_path = cpp_out.get("straight_line_path", [])
-    straight_line_time = cpp_out.get("straight_line_time")
-    straight_line_feasible = cpp_out.get("straight_line_feasible", False)
+    return {
+        "waypoints": leg_waypoints,
+        "total_time_seconds": total_time_seconds,
+        "total_energy_wh": total_energy_wh,
+    }
 
-    straight_line_energy_wh = None
-    pct_time_saved = None
-    pct_energy_saved = None
 
-    if straight_line_feasible and straight_line_path and straight_line_time and straight_line_time > 0:
-        straight_line_energy_wh = estimate_route_energy_wh(
-            straight_line_path,
-            wind_data,
-            grid_coords,
-            C,
-            payload.step_size,
+def normalize_targets(payload: RouteRequest) -> List[Point2D]:
+    if payload.waypoints:
+        return payload.waypoints
+
+    if payload.goal_point is not None:
+        return [payload.goal_point]
+
+    return []
+
+# --- MAIN ROUTING ENDPOINT ---
+@app.post("/api/v1/plan-route", response_model=RouteResponse)
+def plan_route_endpoint(payload: RouteRequest):
+    targets = normalize_targets(payload)
+
+    if not targets:
+        raise HTTPException(status_code=422, detail="No destination points provided.")
+
+    merged_waypoints: List[Point2D] = [payload.start_point]
+    total_time_seconds = 0.0
+    total_energy_wh = 0.0
+
+    current_start = payload.start_point
+
+    for target in targets:
+        leg = plan_single_leg(
+            start_point=current_start,
+            goal_point=target,
+            origin_lat=payload.origin_lat,
+            origin_lon=payload.origin_lon,
+            mode=payload.mode,
+            step_size=payload.step_size,
+            grid_rows=payload.grid_rows,
+            grid_cols=payload.grid_cols,
         )
-        pct_time_saved = 100.0 * (straight_line_time - tot_time) / straight_line_time
-        if straight_line_energy_wh > 0:
-            pct_energy_saved = 100.0 * (straight_line_energy_wh - total_energy_wh) / straight_line_energy_wh
 
-        print(f"[plan-route] Straight-line reference: {straight_line_time:.1f}s, {straight_line_energy_wh:.2f} Wh")
-        print(f"[plan-route] Wind-optimized route:    {tot_time:.1f}s, {total_energy_wh:.2f} Wh")
-        pct_msg = f"{pct_time_saved:.1f}% time"
-        if pct_energy_saved is not None:
-            pct_msg += f", {pct_energy_saved:.1f}% energy"
-        print(f"[plan-route] Improvement vs straight line: {pct_msg}")
-    else:
-        print("[plan-route] Straight-line reference is not flyable at this drone's max airspeed "
-              "(crosswind too strong on the direct bearing) -- no comparison available.")
+        leg_waypoints = leg["waypoints"]
+        if len(leg_waypoints) > 1:
+            merged_waypoints.extend(leg_waypoints[1:])
+        elif not merged_waypoints or merged_waypoints[-1] != target:
+            merged_waypoints.append(target)
+
+        # Keep the exact requested stop even if grid rounding changed the
+        # final solver waypoint slightly.
+        if merged_waypoints[-1] != target:
+            merged_waypoints.append(target)
+
+        total_time_seconds += float(leg["total_time_seconds"])
+        total_energy_wh += float(leg["total_energy_wh"])
+        current_start = target
 
     return RouteResponse(
         optimization_mode=payload.mode,
-        waypoints=waypoints,
+        waypoints=merged_waypoints,
         total_energy_kj=round(total_energy_wh * 3.6, 2),
         total_energy_wh=round(total_energy_wh, 2),
-        total_time_seconds=round(tot_time, 1),
-        formatted_time=f"{int(tot_time // 60)}m {int(tot_time % 60)}s",
-        straight_line_time_seconds=round(straight_line_time, 1) if straight_line_feasible and straight_line_time is not None else None,
-        straight_line_energy_wh=round(straight_line_energy_wh, 2) if straight_line_energy_wh is not None else None,
-        pct_time_saved_vs_straight_line=round(pct_time_saved, 1) if pct_time_saved is not None else None,
-        pct_energy_saved_vs_straight_line=round(pct_energy_saved, 1) if pct_energy_saved is not None else None,
+        total_time_seconds=round(total_time_seconds, 1),
+        formatted_time=f"{int(total_time_seconds // 60)}m {int(total_time_seconds % 60)}s",
+        straight_line_time_seconds=None,
+        straight_line_energy_wh=None,
+        pct_time_saved_vs_straight_line=None,
+        pct_energy_saved_vs_straight_line=None,
     )
 
 if __name__ == "__main__":
